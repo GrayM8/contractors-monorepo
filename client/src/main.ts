@@ -42,10 +42,21 @@ function updateHUD() {
     if (heatEl) heatEl.textContent = String(Math.round(state.heat));
     if (timerEl) timerEl.textContent = (state.timerRemainingMs / 1000).toFixed(1) + "s";
 
+    const contractRowEl = document.getElementById("hud-contract-row");
+    const contractEl = document.getElementById("hud-contract");
+
     const local = state.players.get(network.sessionId);
     if (local) {
       if (ammoEl) ammoEl.textContent = String(local.ammo);
       if (hpEl) hpEl.textContent = String(local.hp);
+
+      // Show contract action text during FIGHT
+      if (local.contractActionText && state.phase === "FIGHT") {
+        if (contractRowEl) contractRowEl.style.display = "block";
+        if (contractEl) contractEl.textContent = local.contractActionText;
+      } else {
+        if (contractRowEl) contractRowEl.style.display = "none";
+      }
     }
   }
   requestAnimationFrame(updateHUD);

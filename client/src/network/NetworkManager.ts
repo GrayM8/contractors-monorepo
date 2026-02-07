@@ -21,6 +21,17 @@ export interface PlayerData {
   aim: number;
   shooting: boolean;
   lastInputSeq: number;
+  // Card/contract fields
+  handItemCardIds: string[];
+  offeredContractId: string;
+  selectedItemId: string;
+  acceptedContractId: string;
+  locked: boolean;
+  contractActionText: string;
+  revealCards: boolean;
+  contractTargetName: string;
+  contractForged: boolean;
+  resolveOutcome: string;
 }
 
 export interface CopData {
@@ -104,9 +115,20 @@ export class NetworkManager {
           aim: player.aim,
           shooting: player.shooting,
           lastInputSeq: player.lastInputSeq,
+          handItemCardIds: Array.from(player.handItemCardIds ?? []),
+          offeredContractId: player.offeredContractId ?? "",
+          selectedItemId: player.selectedItemId ?? "",
+          acceptedContractId: player.acceptedContractId ?? "",
+          locked: player.locked ?? false,
+          contractActionText: player.contractActionText ?? "",
+          revealCards: player.revealCards ?? false,
+          contractTargetName: player.contractTargetName ?? "",
+          contractForged: player.contractForged ?? false,
+          resolveOutcome: player.resolveOutcome ?? "",
         };
         this.roomState!.players.set(key, pd);
 
+        // Combat fields
         player.listen("x", (val: number) => { pd.x = val; });
         player.listen("y", (val: number) => { pd.y = val; });
         player.listen("aim", (val: number) => { pd.aim = val; });
@@ -116,6 +138,31 @@ export class NetworkManager {
         player.listen("shooting", (val: boolean) => { pd.shooting = val; });
         player.listen("role", (val: string) => { pd.role = val; });
         player.listen("lastInputSeq", (val: number) => { pd.lastInputSeq = val; });
+
+        // Card/contract fields
+        player.listen("offeredContractId", (val: string) => { pd.offeredContractId = val; });
+        player.listen("selectedItemId", (val: string) => { pd.selectedItemId = val; });
+        player.listen("acceptedContractId", (val: string) => { pd.acceptedContractId = val; });
+        player.listen("locked", (val: boolean) => { pd.locked = val; });
+        player.listen("contractActionText", (val: string) => { pd.contractActionText = val; });
+        player.listen("revealCards", (val: boolean) => { pd.revealCards = val; });
+        player.listen("contractTargetName", (val: string) => { pd.contractTargetName = val; });
+        player.listen("contractForged", (val: boolean) => { pd.contractForged = val; });
+        player.listen("resolveOutcome", (val: string) => { pd.resolveOutcome = val; });
+
+        // ArraySchema for handItemCardIds — listen for changes
+        if (player.handItemCardIds) {
+          player.handItemCardIds.onChange(() => {
+            pd.handItemCardIds = Array.from(player.handItemCardIds);
+          });
+          // Also catch initial / full replacement via onAdd
+          player.handItemCardIds.onAdd(() => {
+            pd.handItemCardIds = Array.from(player.handItemCardIds);
+          });
+          player.handItemCardIds.onRemove(() => {
+            pd.handItemCardIds = Array.from(player.handItemCardIds);
+          });
+        }
       });
 
       this.room.state.players.onRemove((_player: any, key: string) => {
@@ -146,6 +193,8 @@ export class NetworkManager {
     }
   }
 
+  // ── Send methods ───────────────────────────────────────────
+
   sendInput(input: {
     moveX: number;
     moveY: number;
@@ -154,6 +203,18 @@ export class NetworkManager {
     seq: number;
   }) {
     this.room?.send("input", input);
+  }
+
+  sendSelectItem(itemId: string) {
+    this.room?.send("loadout.selectItem", { itemId });
+  }
+
+  sendAcceptContract() {
+    this.room?.send("loadout.acceptContract", {});
+  }
+
+  sendRefuseContract() {
+    this.room?.send("contract.refuse", {});
   }
 
   getRoom(): Room | null {
