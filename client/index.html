@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Contractors on the Run!</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; overflow: hidden; }
+    #game-container { position: relative; width: 100vw; height: 100vh; }
+    #hud {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      color: #0f0; font-family: monospace; font-size: 14px;
+      background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 4px;
+      pointer-events: none; user-select: none;
+    }
+    #hud .label { color: #888; }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <div id="hud">
+      <div>Phase: <span id="hud-phase" class="label">--</span></div>
+      <div>Round: <span id="hud-round" class="label">--</span></div>
+      <div>Heat:  <span id="hud-heat" class="label">--</span></div>
+      <div>Timer: <span id="hud-timer" class="label">--</span></div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
