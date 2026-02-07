@@ -6,6 +6,7 @@ export interface RoomState {
   heat: number;
   timerRemainingMs: number;
   players: Map<string, PlayerData>;
+  cops: Map<string, CopData>;
 }
 
 export interface PlayerData {
@@ -22,6 +23,14 @@ export interface PlayerData {
   lastInputSeq: number;
 }
 
+export interface CopData {
+  id: string;
+  x: number;
+  y: number;
+  hp: number;
+  speed: number;
+}
+
 type PhaseChangeCallback = (phase: string) => void;
 
 export class NetworkManager {
@@ -29,7 +38,6 @@ export class NetworkManager {
   private client: Client;
   private room: Room | null = null;
 
-  /** Reactive snapshot of the room state for HUD / scenes */
   public roomState: RoomState | null = null;
   public sessionId: string = "";
 
@@ -58,34 +66,31 @@ export class NetworkManager {
       this.sessionId = this.room.sessionId;
       console.log("[Network] Joined room", this.room.id);
 
-      // Initialize local state mirror
       this.roomState = {
         phase: "LOBBY",
         roundNumber: 0,
         heat: 0,
         timerRemainingMs: 0,
         players: new Map(),
+        cops: new Map(),
       };
 
-      // Listen for state changes
+      // Scalar state listeners
       this.room.state.listen("phase", (value: string) => {
         if (this.roomState) this.roomState.phase = value;
         this.phaseCallbacks.forEach((cb) => cb(value));
       });
-
       this.room.state.listen("roundNumber", (value: number) => {
         if (this.roomState) this.roomState.roundNumber = value;
       });
-
       this.room.state.listen("heat", (value: number) => {
         if (this.roomState) this.roomState.heat = value;
       });
-
       this.room.state.listen("timerRemainingMs", (value: number) => {
         if (this.roomState) this.roomState.timerRemainingMs = value;
       });
 
-      // Player map events
+      // Player map
       this.room.state.players.onAdd((player: any, key: string) => {
         const pd: PlayerData = {
           id: player.id,
@@ -102,11 +107,11 @@ export class NetworkManager {
         };
         this.roomState!.players.set(key, pd);
 
-        // Listen for individual player field changes
         player.listen("x", (val: number) => { pd.x = val; });
         player.listen("y", (val: number) => { pd.y = val; });
         player.listen("aim", (val: number) => { pd.aim = val; });
         player.listen("hp", (val: number) => { pd.hp = val; });
+        player.listen("ammo", (val: number) => { pd.ammo = val; });
         player.listen("alive", (val: boolean) => { pd.alive = val; });
         player.listen("shooting", (val: boolean) => { pd.shooting = val; });
         player.listen("role", (val: string) => { pd.role = val; });
@@ -115,6 +120,26 @@ export class NetworkManager {
 
       this.room.state.players.onRemove((_player: any, key: string) => {
         this.roomState!.players.delete(key);
+      });
+
+      // Cops map
+      this.room.state.cops.onAdd((cop: any, key: string) => {
+        const cd: CopData = {
+          id: cop.id,
+          x: cop.x,
+          y: cop.y,
+          hp: cop.hp,
+          speed: cop.speed,
+        };
+        this.roomState!.cops.set(key, cd);
+
+        cop.listen("x", (val: number) => { cd.x = val; });
+        cop.listen("y", (val: number) => { cd.y = val; });
+        cop.listen("hp", (val: number) => { cd.hp = val; });
+      });
+
+      this.room.state.cops.onRemove((_cop: any, key: string) => {
+        this.roomState!.cops.delete(key);
       });
     } catch (err) {
       console.error("[Network] Failed to connect:", err);

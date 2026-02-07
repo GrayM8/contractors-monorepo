@@ -1,4 +1,4 @@
-import { Schema, type, MapSchema, filter } from "@colyseus/schema";
+import { Schema, type, MapSchema } from "@colyseus/schema";
 
 export enum Phase {
   LOBBY   = "LOBBY",
@@ -22,9 +22,18 @@ export class PlayerState extends Schema {
   @type("boolean") shooting: boolean = false;
   @type("number")  lastInputSeq: number = 0;
 
-  // Non-synced fields for server-side movement tracking
+  // Non-synced server-side fields
   _moveX: number = 0;
   _moveY: number = 0;
+  _lastFireTime: number = 0;
+}
+
+export class CopState extends Schema {
+  @type("string") id: string = "";
+  @type("number") x: number = 0;
+  @type("number") y: number = 0;
+  @type("number") hp: number = 50;
+  @type("number") speed: number = 80;
 }
 
 export class MatchState extends Schema {
@@ -33,4 +42,5 @@ export class MatchState extends Schema {
   @type("number")  heat: number = 0;
   @type("number")  timerRemainingMs: number = 0;
   @type({ map: PlayerState }) players = new MapSchema<PlayerState>();
+  @type({ map: CopState })    cops    = new MapSchema<CopState>();
 }

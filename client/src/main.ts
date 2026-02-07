@@ -33,11 +33,20 @@ function updateHUD() {
   const heatEl = document.getElementById("hud-heat");
   const timerEl = document.getElementById("hud-timer");
 
+  const ammoEl = document.getElementById("hud-ammo");
+  const hpEl = document.getElementById("hud-hp");
+
   if (state) {
     if (phaseEl) phaseEl.textContent = state.phase;
     if (roundEl) roundEl.textContent = String(state.roundNumber);
     if (heatEl) heatEl.textContent = String(Math.round(state.heat));
     if (timerEl) timerEl.textContent = (state.timerRemainingMs / 1000).toFixed(1) + "s";
+
+    const local = state.players.get(network.sessionId);
+    if (local) {
+      if (ammoEl) ammoEl.textContent = String(local.ammo);
+      if (hpEl) hpEl.textContent = String(local.hp);
+    }
   }
   requestAnimationFrame(updateHUD);
 }
