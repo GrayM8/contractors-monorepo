@@ -32,6 +32,13 @@ export interface PlayerData {
   contractTargetName: string;
   contractForged: boolean;
   resolveOutcome: string;
+  // Cop-spectator fields
+  wantsCopNextFight: boolean;
+  controlledCopId: string;
+  // Trading fields
+  tradedThisRound: boolean;
+  pendingTradeFromId: string;
+  pendingTradeOfferedItemId: string;
 }
 
 export interface CopData {
@@ -40,6 +47,7 @@ export interface CopData {
   y: number;
   hp: number;
   speed: number;
+  controllerId: string;
 }
 
 type PhaseChangeCallback = (phase: string) => void;
@@ -125,6 +133,11 @@ export class NetworkManager {
           contractTargetName: player.contractTargetName ?? "",
           contractForged: player.contractForged ?? false,
           resolveOutcome: player.resolveOutcome ?? "",
+          wantsCopNextFight: player.wantsCopNextFight ?? false,
+          controlledCopId: player.controlledCopId ?? "",
+          tradedThisRound: player.tradedThisRound ?? false,
+          pendingTradeFromId: player.pendingTradeFromId ?? "",
+          pendingTradeOfferedItemId: player.pendingTradeOfferedItemId ?? "",
         };
         this.roomState!.players.set(key, pd);
 
@@ -150,12 +163,20 @@ export class NetworkManager {
         player.listen("contractForged", (val: boolean) => { pd.contractForged = val; });
         player.listen("resolveOutcome", (val: string) => { pd.resolveOutcome = val; });
 
+        // Cop-spectator fields
+        player.listen("wantsCopNextFight", (val: boolean) => { pd.wantsCopNextFight = val; });
+        player.listen("controlledCopId", (val: string) => { pd.controlledCopId = val; });
+
+        // Trading fields
+        player.listen("tradedThisRound", (val: boolean) => { pd.tradedThisRound = val; });
+        player.listen("pendingTradeFromId", (val: string) => { pd.pendingTradeFromId = val; });
+        player.listen("pendingTradeOfferedItemId", (val: string) => { pd.pendingTradeOfferedItemId = val; });
+
         // ArraySchema for handItemCardIds — listen for changes
         if (player.handItemCardIds) {
           player.handItemCardIds.onChange(() => {
             pd.handItemCardIds = Array.from(player.handItemCardIds);
           });
-          // Also catch initial / full replacement via onAdd
           player.handItemCardIds.onAdd(() => {
             pd.handItemCardIds = Array.from(player.handItemCardIds);
           });
@@ -177,12 +198,14 @@ export class NetworkManager {
           y: cop.y,
           hp: cop.hp,
           speed: cop.speed,
+          controllerId: cop.controllerId ?? "",
         };
         this.roomState!.cops.set(key, cd);
 
         cop.listen("x", (val: number) => { cd.x = val; });
         cop.listen("y", (val: number) => { cd.y = val; });
         cop.listen("hp", (val: number) => { cd.hp = val; });
+        cop.listen("controllerId", (val: string) => { cd.controllerId = val; });
       });
 
       this.room.state.cops.onRemove((_cop: any, key: string) => {
@@ -215,6 +238,34 @@ export class NetworkManager {
 
   sendRefuseContract() {
     this.room?.send("contract.refuse", {});
+  }
+
+  // Cop spectator
+  sendOptCop() {
+    this.room?.send("spectator.optCop", {});
+  }
+
+  sendCopInput(input: {
+    moveX: number;
+    moveY: number;
+    aimAngle: number;
+    shooting: boolean;
+    seq: number;
+  }) {
+    this.room?.send("cop.input", input);
+  }
+
+  sendCopArrest() {
+    this.room?.send("cop.arrest", {});
+  }
+
+  // Trading
+  sendTradeOffer(toSessionId: string, offeredItemCardId: string) {
+    this.room?.send("trade.offer", { toSessionId, offeredItemCardId });
+  }
+
+  sendTradeRespond(fromSessionId: string, accept: boolean, requestedItemCardId?: string) {
+    this.room?.send("trade.respond", { fromSessionId, accept, requestedItemCardId });
   }
 
   getRoom(): Room | null {

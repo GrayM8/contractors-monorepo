@@ -22,36 +22,45 @@ export class PlayerState extends Schema {
   @type("boolean") shooting: boolean = false;
   @type("number")  lastInputSeq: number = 0;
 
-  // ── Card/contract state (synced to owning client) ──────────
+  // ── Card/contract state (synced) ───────────────────────────
   @type(["string"]) handItemCardIds = new ArraySchema<string>();
   @type("string")   offeredContractId: string = "";
   @type("string")   selectedItemId: string = "";
-  @type("string")   acceptedContractId: string = "";  // "" = refused/none
+  @type("string")   acceptedContractId: string = "";
   @type("boolean")  locked: boolean = false;
-  @type("string")   contractActionText: string = "";   // shown during FIGHT
-  @type("boolean")  revealCards: boolean = false;       // true = others can see your cards
-  @type("string")   contractTargetName: string = "";    // display name of assigned target
-  @type("boolean")  contractForged: boolean = false;    // cannot refuse
-  @type("string")   resolveOutcome: string = "";        // result text shown in RESOLVE
+  @type("string")   contractActionText: string = "";
+  @type("boolean")  revealCards: boolean = false;
+  @type("string")   contractTargetName: string = "";
+  @type("boolean")  contractForged: boolean = false;
+  @type("string")   resolveOutcome: string = "";
+
+  // ── Cop-spectator fields (synced) ──────────────────────────
+  @type("boolean")  wantsCopNextFight: boolean = false;
+  @type("string")   controlledCopId: string = "";  // id of the cop this player controls
+
+  // ── Trading fields (synced) ────────────────────────────────
+  @type("boolean")  tradedThisRound: boolean = false;
+  @type("string")   pendingTradeFromId: string = "";       // sessionId of offerer
+  @type("string")   pendingTradeOfferedItemId: string = ""; // item being offered to us
 
   // ── Non-synced server-side fields ──────────────────────────
   _moveX: number = 0;
   _moveY: number = 0;
   _lastFireTime: number = 0;
 
-  // Per-round combat metrics (server-only, reset each fight)
+  // Per-round combat metrics
   _distanceMoved: number = 0;
   _ammoSpent: number = 0;
   _friendlyFireDamage: number = 0;
-  _enemyDamage: number = 0;  // total damage dealt to other players
+  _enemyDamage: number = 0;
   _kills: number = 0;
   _killsByTargetId: Map<string, number> = new Map();
   _damageByTargetId: Map<string, number> = new Map();
 
-  // Contract assigned target (server-only)
+  // Contract assigned target
   _contractTargetId: string = "";
 
-  // Next-round modifiers (applied at start of next fight)
+  // Next-round modifiers
   _nextHpMul: number = 1;
   _nextAmmoMul: number = 1;
   _nextSpeedMul: number = 1;
@@ -59,6 +68,9 @@ export class PlayerState extends Schema {
 
   // Current round effective speed multiplier
   _speedMul: number = 1;
+
+  // Cop arrest tracking (server-only): set of player IDs already arrested this round
+  _copArrestedIds: Set<string> = new Set();
 }
 
 export class CopState extends Schema {
@@ -67,6 +79,7 @@ export class CopState extends Schema {
   @type("number") y: number = 0;
   @type("number") hp: number = 50;
   @type("number") speed: number = 80;
+  @type("string") controllerId: string = ""; // sessionId of controlling player, "" = AI
 }
 
 export class MatchState extends Schema {

@@ -32,6 +32,10 @@ export class FightScene extends Phaser.Scene {
   private deathText: Phaser.GameObjects.Text | null = null;
   private spectateText: Phaser.GameObjects.Text | null = null;
 
+  // Cop mode overlay
+  private copModeText: Phaser.GameObjects.Text | null = null;
+  private copArrestText: Phaser.GameObjects.Text | null = null;
+
   private inputSeq = 0;
   private lastInputTime = 0;
 
@@ -73,17 +77,41 @@ export class FightScene extends Phaser.Scene {
     if (!state) return;
 
     const localPlayer = state.players.get(this.network.sessionId);
-    const isAlive = localPlayer?.alive ?? false;
+    if (!localPlayer) return;
 
-    // Only send inputs if alive
-    if (isAlive && time - this.lastInputTime >= INPUT_SEND_RATE) {
+    const isCop = localPlayer.role === "cop";
+    const isAlive = localPlayer.alive;
+    const isSpectator = localPlayer.role === "spectator";
+
+    // Send inputs if alive player or cop
+    if ((isAlive || isCop) && time - this.lastInputTime >= INPUT_SEND_RATE) {
       this.lastInputTime = time;
-      this.sendInput();
+      if (isCop) {
+        this.sendCopInput(localPlayer);
+      } else {
+        this.sendInput();
+      }
+    }
+
+    // Handle cop arrest on click
+    if (isCop && this.input.activePointer.isDown) {
+      this.network.sendCopArrest();
     }
 
     this.renderPlayers(state.players);
-    this.renderCops(state.cops);
-    this.updateDeathOverlay(isAlive, state.players);
+    this.renderCops(state.cops, localPlayer);
+
+    if (isCop) {
+      this.updateCopOverlay();
+      // Hide death overlay if showing
+      this.clearDeathOverlay();
+    } else if (!isAlive || isSpectator) {
+      this.updateDeathOverlay(state.players);
+      this.clearCopOverlay();
+    } else {
+      this.clearDeathOverlay();
+      this.clearCopOverlay();
+    }
   }
 
   // ── Input ──────────────────────────────────────────────────
@@ -108,12 +136,36 @@ export class FightScene extends Phaser.Scene {
     });
   }
 
+  private sendCopInput(localPlayer: PlayerData) {
+    const moveX = (this.keys.D.isDown ? 1 : 0) - (this.keys.A.isDown ? 1 : 0);
+    const moveY = (this.keys.S.isDown ? 1 : 0) - (this.keys.W.isDown ? 1 : 0);
+
+    // Aim from the controlled cop's position
+    const cop = this.network.roomState?.cops.get(localPlayer.controlledCopId);
+    const cx = cop?.x ?? 600;
+    const cy = cop?.y ?? 400;
+    const pointer = this.input.activePointer;
+    const aimAngle = Math.atan2(pointer.worldY - cy, pointer.worldX - cx);
+
+    this.inputSeq++;
+    this.network.sendCopInput({
+      moveX,
+      moveY,
+      aimAngle,
+      shooting: false,
+      seq: this.inputSeq,
+    });
+  }
+
   // ── Player rendering ───────────────────────────────────────
 
   private renderPlayers(players: Map<string, PlayerData>) {
     const seenIds = new Set<string>();
 
     players.forEach((player, id) => {
+      // Don't render cop-role players as player circles
+      if (player.role === "cop") return;
+
       seenIds.add(id);
       const isLocal = id === this.network.sessionId;
 
@@ -167,7 +219,6 @@ export class FightScene extends Phaser.Scene {
         this.hpBarFills.set(id, hpFill);
       }
       hpFill.setSize(fillWidth, HP_BAR_HEIGHT);
-      // Align fill to left edge of background
       hpFill.setPosition(
         player.x - (HP_BAR_WIDTH - fillWidth) / 2,
         player.y + HP_BAR_OFFSET_Y
@@ -209,20 +260,35 @@ export class FightScene extends Phaser.Scene {
 
   // ── Cop rendering ──────────────────────────────────────────
 
-  private renderCops(cops: Map<string, CopData>) {
+  private renderCops(cops: Map<string, CopData>, localPlayer: PlayerData) {
     const seenIds = new Set<string>();
 
     cops.forEach((cop, id) => {
       seenIds.add(id);
 
+      const isControlled = localPlayer.role === "cop" && localPlayer.controlledCopId === id;
+
       let circle = this.copCircles.get(id);
       if (!circle) {
-        circle = this.add.circle(cop.x, cop.y, COP_RADIUS, 0x4444ff);
-        circle.setStrokeStyle(2, 0x8888ff);
+        circle = this.add.circle(cop.x, cop.y, COP_RADIUS, isControlled ? 0x44aaff : 0x4444ff);
+        circle.setStrokeStyle(isControlled ? 3 : 2, isControlled ? 0xffffff : 0x8888ff);
         circle.setDepth(10);
         this.copCircles.set(id, circle);
       }
       circle.setPosition(cop.x, cop.y);
+
+      // Update color in case controllerId changed
+      if (isControlled) {
+        circle.setFillStyle(0x44aaff);
+        circle.setStrokeStyle(3, 0xffffff);
+      } else if (cop.controllerId) {
+        // Player-controlled cop (other player)
+        circle.setFillStyle(0x6644cc);
+        circle.setStrokeStyle(2, 0x9988ff);
+      } else {
+        circle.setFillStyle(0x4444ff);
+        circle.setStrokeStyle(2, 0x8888ff);
+      }
     });
 
     // Cleanup removed cops
@@ -234,58 +300,82 @@ export class FightScene extends Phaser.Scene {
     }
   }
 
+  // ── Cop mode overlay ─────────────────────────────────────
+
+  private updateCopOverlay() {
+    if (!this.copModeText) {
+      this.copModeText = this.add.text(600, 40, "COP MODE", {
+        fontSize: "24px", color: "#44aaff", fontStyle: "bold",
+        backgroundColor: "#001133", padding: { x: 16, y: 6 },
+      }).setOrigin(0.5).setDepth(51);
+
+      this.copArrestText = this.add.text(600, 72, "WASD to move | LMB to arrest nearby player", {
+        fontSize: "12px", color: "#8888cc",
+      }).setOrigin(0.5).setDepth(51);
+    }
+  }
+
+  private clearCopOverlay() {
+    if (this.copModeText) {
+      this.copModeText.destroy();
+      this.copModeText = null;
+    }
+    if (this.copArrestText) {
+      this.copArrestText.destroy();
+      this.copArrestText = null;
+    }
+  }
+
   // ── Death overlay & spectate ───────────────────────────────
 
-  private updateDeathOverlay(isAlive: boolean, players: Map<string, PlayerData>) {
-    if (!isAlive) {
-      // Show death overlay if not already shown
-      if (!this.deathOverlay) {
-        this.deathOverlay = this.add.rectangle(600, 400, 1200, 800, 0x000000, 0.4);
-        this.deathOverlay.setDepth(50);
+  private updateDeathOverlay(players: Map<string, PlayerData>) {
+    if (!this.deathOverlay) {
+      this.deathOverlay = this.add.rectangle(600, 400, 1200, 800, 0x000000, 0.4);
+      this.deathOverlay.setDepth(50);
 
-        this.deathText = this.add.text(600, 80, "YOU ARE DEAD", {
-          fontSize: "36px",
-          color: "#ff4444",
-          fontStyle: "bold",
-        }).setOrigin(0.5).setDepth(51);
+      this.deathText = this.add.text(600, 80, "YOU ARE DEAD", {
+        fontSize: "36px",
+        color: "#ff4444",
+        fontStyle: "bold",
+      }).setOrigin(0.5).setDepth(51);
 
-        this.spectateText = this.add.text(600, 120, "Spectating...", {
-          fontSize: "16px",
-          color: "#aaaaaa",
-        }).setOrigin(0.5).setDepth(51);
+      this.spectateText = this.add.text(600, 120, "Spectating...", {
+        fontSize: "16px",
+        color: "#aaaaaa",
+      }).setOrigin(0.5).setDepth(51);
+    }
+
+    // Spectate: follow nearest alive player
+    let nearestAlive: PlayerData | null = null;
+    let nearestDist = Infinity;
+    const localPlayer = players.get(this.network.sessionId);
+    const myX = localPlayer?.x ?? 600;
+    const myY = localPlayer?.y ?? 400;
+
+    players.forEach((p) => {
+      if (!p.alive || p.id === this.network.sessionId) return;
+      const dx = p.x - myX;
+      const dy = p.y - myY;
+      const d = dx * dx + dy * dy;
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearestAlive = p;
       }
+    });
 
-      // Spectate: follow nearest alive player
-      let nearestAlive: PlayerData | null = null;
-      let nearestDist = Infinity;
-      const localPlayer = players.get(this.network.sessionId);
-      const myX = localPlayer?.x ?? 600;
-      const myY = localPlayer?.y ?? 400;
+    if (nearestAlive && this.spectateText) {
+      this.spectateText.setText(`Spectating: ${(nearestAlive as PlayerData).name}`);
+    }
+  }
 
-      players.forEach((p) => {
-        if (!p.alive || p.id === this.network.sessionId) return;
-        const dx = p.x - myX;
-        const dy = p.y - myY;
-        const d = dx * dx + dy * dy;
-        if (d < nearestDist) {
-          nearestDist = d;
-          nearestAlive = p;
-        }
-      });
-
-      if (nearestAlive && this.spectateText) {
-        this.spectateText.setText(`Spectating: ${(nearestAlive as PlayerData).name}`);
-      }
-    } else {
-      // Remove death overlay if alive
-      if (this.deathOverlay) {
-        this.deathOverlay.destroy();
-        this.deathOverlay = null;
-        this.deathText?.destroy();
-        this.deathText = null;
-        this.spectateText?.destroy();
-        this.spectateText = null;
-      }
+  private clearDeathOverlay() {
+    if (this.deathOverlay) {
+      this.deathOverlay.destroy();
+      this.deathOverlay = null;
+      this.deathText?.destroy();
+      this.deathText = null;
+      this.spectateText?.destroy();
+      this.spectateText = null;
     }
   }
 
@@ -295,11 +385,7 @@ export class FightScene extends Phaser.Scene {
     for (const [id] of this.playerCircles) this.removePlayerVisuals(id);
     for (const [, gfx] of this.copCircles) gfx.destroy();
     this.copCircles.clear();
-    this.deathOverlay?.destroy();
-    this.deathOverlay = null;
-    this.deathText?.destroy();
-    this.deathText = null;
-    this.spectateText?.destroy();
-    this.spectateText = null;
+    this.clearDeathOverlay();
+    this.clearCopOverlay();
   }
 }

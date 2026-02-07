@@ -32,6 +32,11 @@ const COP_ARREST_RADIUS = 30;
 const COP_HP = 50;
 const COP_SPEED = 80;
 
+// Player-controlled cop stats
+const PLAYER_COP_HP = 30;
+const PLAYER_COP_SPEED = 60;
+const COP_ARREST_GRACE_MS = 5000; // no arrests in first 5s
+
 interface InputMessage {
   moveX: number;
   moveY: number;
@@ -45,6 +50,7 @@ export class MatchRoom extends Room<MatchState> {
   private phaseTimeout: ReturnType<typeof setTimeout> | null = null;
   private nextCopId = 0;
   private timeSinceLastCopSpawn = 0;
+  private fightElapsedMs = 0;
 
   onCreate() {
     this.setState(new MatchState());
@@ -53,20 +59,39 @@ export class MatchRoom extends Room<MatchState> {
     this.state.heat = 0;
     this.state.timerRemainingMs = 0;
 
+    // ── Combat input ─────────────────────────────────────────
     this.onMessage("input", (client, msg: InputMessage) => {
       this.handleInput(client, msg);
     });
 
+    // ── Card/contract messages ───────────────────────────────
     this.onMessage("loadout.selectItem", (client, msg: { itemId: string }) => {
       this.handleSelectItem(client, msg.itemId);
     });
-
     this.onMessage("loadout.acceptContract", (client) => {
       this.handleAcceptContract(client);
     });
-
     this.onMessage("contract.refuse", (client) => {
       this.handleRefuseContract(client);
+    });
+
+    // ── Cop spectator opt-in ─────────────────────────────────
+    this.onMessage("spectator.optCop", (client) => {
+      this.handleOptCop(client);
+    });
+    this.onMessage("cop.input", (client, msg: InputMessage) => {
+      this.handleCopInput(client, msg);
+    });
+    this.onMessage("cop.arrest", (client) => {
+      this.handleCopArrest(client);
+    });
+
+    // ── Trading messages ─────────────────────────────────────
+    this.onMessage("trade.offer", (client, msg: { toSessionId: string; offeredItemCardId: string }) => {
+      this.handleTradeOffer(client, msg.toSessionId, msg.offeredItemCardId);
+    });
+    this.onMessage("trade.respond", (client, msg: { fromSessionId: string; accept: boolean; requestedItemCardId?: string }) => {
+      this.handleTradeRespond(client, msg.fromSessionId, msg.accept, msg.requestedItemCardId);
     });
 
     console.log("[MatchRoom] Created");
@@ -92,6 +117,11 @@ export class MatchRoom extends Room<MatchState> {
   }
 
   onLeave(client: Client) {
+    // Remove any cop they control
+    const player = this.state.players.get(client.sessionId);
+    if (player?.controlledCopId) {
+      this.state.cops.delete(player.controlledCopId);
+    }
     this.state.players.delete(client.sessionId);
     console.log(`[MatchRoom] ${client.sessionId} left`);
   }
@@ -101,7 +131,9 @@ export class MatchRoom extends Room<MatchState> {
     console.log("[MatchRoom] Disposed");
   }
 
-  // ── Game flow ──────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  GAME FLOW
+  // ══════════════════════════════════════════════════════════
 
   private startGame() {
     console.log("[MatchRoom] Starting game");
@@ -115,22 +147,10 @@ export class MatchRoom extends Room<MatchState> {
     console.log(`[MatchRoom] Phase -> ${phase} (round ${this.state.roundNumber})`);
 
     switch (phase) {
-      case Phase.CARD:
-        this.beginCardPhase();
-        break;
-
-      case Phase.LOCK:
-        this.beginLockPhase();
-        break;
-
-      case Phase.FIGHT:
-        this.startFight();
-        break;
-
-      case Phase.RESOLVE:
-        this.beginResolvePhase();
-        break;
-
+      case Phase.CARD:    this.beginCardPhase(); break;
+      case Phase.LOCK:    this.beginLockPhase(); break;
+      case Phase.FIGHT:   this.startFight(); break;
+      case Phase.RESOLVE: this.beginResolvePhase(); break;
       case Phase.END:
         this.state.timerRemainingMs = 0;
         this.clearCops();
@@ -139,7 +159,9 @@ export class MatchRoom extends Room<MatchState> {
     }
   }
 
-  // ── CARD phase ─────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  CARD PHASE
+  // ══════════════════════════════════════════════════════════
 
   private beginCardPhase() {
     this.state.timerRemainingMs = CARD_PHASE_MS;
@@ -154,12 +176,16 @@ export class MatchRoom extends Room<MatchState> {
       player.contractTargetName = "";
       player.contractForged = false;
       player.resolveOutcome = "";
+      player.tradedThisRound = false;
+      player.pendingTradeFromId = "";
+      player.pendingTradeOfferedItemId = "";
+      player.controlledCopId = "";
 
       // Apply revealCards from previous round modifier
       player.revealCards = player._nextRevealCards;
       player._nextRevealCards = false;
 
-      if (player.role === "spectator") return; // spectators don't get cards
+      if (player.role === "spectator") return; // spectators get cop opt-in instead
 
       // Deal 4 random item cards
       const items = dealItemCards(4);
@@ -189,43 +215,43 @@ export class MatchRoom extends Room<MatchState> {
     this.phaseTimeout = setTimeout(() => this.transitionTo(Phase.LOCK), CARD_PHASE_MS);
   }
 
-  // ── LOCK phase ─────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  LOCK PHASE
+  // ══════════════════════════════════════════════════════════
 
   private beginLockPhase() {
     this.state.timerRemainingMs = LOCK_PHASE_MS;
 
-    // Auto-select for players who haven't chosen
     this.state.players.forEach((player) => {
       if (player.role === "spectator") return;
 
-      // If no item selected, pick first in hand
       if (!player.selectedItemId && player.handItemCardIds.length > 0) {
         player.selectedItemId = player.handItemCardIds.at(0) ?? "";
       }
 
-      // If contract not explicitly accepted/refused:
-      // non-forged → auto-refuse, forged → auto-accept
       if (!player.locked) {
         if (player.contractForged && player.offeredContractId) {
           player.acceptedContractId = player.offeredContractId;
         }
-        // else acceptedContractId stays ""
       }
 
       player.locked = true;
+      // Clear any pending trade
+      player.pendingTradeFromId = "";
+      player.pendingTradeOfferedItemId = "";
     });
 
     this.phaseTimeout = setTimeout(() => this.transitionTo(Phase.FIGHT), LOCK_PHASE_MS);
   }
 
-  // ── Card/contract message handlers ─────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  CARD/CONTRACT MESSAGE HANDLERS
+  // ══════════════════════════════════════════════════════════
 
   private handleSelectItem(client: Client, itemId: string) {
     if (this.state.phase !== Phase.CARD && this.state.phase !== Phase.LOCK) return;
     const player = this.state.players.get(client.sessionId);
     if (!player || player.role === "spectator" || player.locked) return;
-
-    // Validate the item is in their hand
     if (!player.handItemCardIds.includes(itemId)) return;
     player.selectedItemId = itemId;
   }
@@ -238,7 +264,6 @@ export class MatchRoom extends Room<MatchState> {
 
     player.acceptedContractId = player.offeredContractId;
     player.locked = true;
-    // Auto-select first item if none chosen
     if (!player.selectedItemId && player.handItemCardIds.length > 0) {
       player.selectedItemId = player.handItemCardIds.at(0) ?? "";
     }
@@ -248,8 +273,6 @@ export class MatchRoom extends Room<MatchState> {
     if (this.state.phase !== Phase.CARD && this.state.phase !== Phase.LOCK) return;
     const player = this.state.players.get(client.sessionId);
     if (!player || player.role === "spectator" || player.locked) return;
-
-    // Cannot refuse forged contracts
     if (player.contractForged) return;
 
     player.acceptedContractId = "";
@@ -259,15 +282,148 @@ export class MatchRoom extends Room<MatchState> {
     }
   }
 
-  // ── FIGHT phase ────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  SPECTATOR COP OPT-IN
+  // ══════════════════════════════════════════════════════════
+
+  private handleOptCop(client: Client) {
+    if (this.state.phase !== Phase.CARD && this.state.phase !== Phase.LOCK) return;
+    const player = this.state.players.get(client.sessionId);
+    if (!player || player.role !== "spectator") return;
+    player.wantsCopNextFight = !player.wantsCopNextFight;
+    console.log(`[MatchRoom] ${player.name} toggled cop opt-in: ${player.wantsCopNextFight}`);
+  }
+
+  private handleCopInput(client: Client, msg: InputMessage) {
+    if (this.state.phase !== Phase.FIGHT) return;
+    const player = this.state.players.get(client.sessionId);
+    if (!player || player.role !== "cop" || !player.controlledCopId) return;
+
+    const cop = this.state.cops.get(player.controlledCopId);
+    if (!cop) return;
+
+    // Store move direction on the player (we'll apply to cop in tick)
+    player._moveX = Math.max(-1, Math.min(1, msg.moveX));
+    player._moveY = Math.max(-1, Math.min(1, msg.moveY));
+    player.aim = msg.aimAngle;
+  }
+
+  private handleCopArrest(client: Client) {
+    if (this.state.phase !== Phase.FIGHT) return;
+    if (this.fightElapsedMs < COP_ARREST_GRACE_MS) return; // grace period
+
+    const player = this.state.players.get(client.sessionId);
+    if (!player || player.role !== "cop" || !player.controlledCopId) return;
+
+    const cop = this.state.cops.get(player.controlledCopId);
+    if (!cop) return;
+
+    // Find nearest alive player within arrest radius
+    const alivePlayers = Array.from(this.state.players.values()).filter(
+      (p) => p.role === "player" && p.alive
+    );
+
+    for (const target of alivePlayers) {
+      const dx = target.x - cop.x;
+      const dy = target.y - cop.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist <= COP_ARREST_RADIUS) {
+        // Can't arrest same player twice per round
+        if (player._copArrestedIds.has(target.id)) continue;
+
+        player._copArrestedIds.add(target.id);
+        target.alive = false;
+        target.role = "spectator";
+        target._moveX = 0;
+        target._moveY = 0;
+        target.shooting = false;
+        console.log(`[MatchRoom] ${target.name} arrested by cop-player ${player.name}`);
+        return; // one arrest per attempt
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  TRADING
+  // ══════════════════════════════════════════════════════════
+
+  private handleTradeOffer(client: Client, toSessionId: string, offeredItemCardId: string) {
+    if (this.state.phase !== Phase.CARD) return;
+    const from = this.state.players.get(client.sessionId);
+    const to = this.state.players.get(toSessionId);
+    if (!from || !to) return;
+    if (from.role === "spectator" || to.role === "spectator") return;
+    if (from.tradedThisRound || to.tradedThisRound) return;
+    if (from.locked || to.locked) return;
+    if (!from.handItemCardIds.includes(offeredItemCardId)) return;
+    // Don't allow offering to yourself
+    if (client.sessionId === toSessionId) return;
+    // Clear any existing pending trade on target
+    to.pendingTradeFromId = client.sessionId;
+    to.pendingTradeOfferedItemId = offeredItemCardId;
+    console.log(`[MatchRoom] ${from.name} offered ${offeredItemCardId} to ${to.name}`);
+  }
+
+  private handleTradeRespond(client: Client, fromSessionId: string, accept: boolean, requestedItemCardId?: string) {
+    if (this.state.phase !== Phase.CARD) return;
+    const to = this.state.players.get(client.sessionId);
+    const from = this.state.players.get(fromSessionId);
+    if (!to || !from) return;
+
+    // Validate this is the pending trade
+    if (to.pendingTradeFromId !== fromSessionId) return;
+    if (to.tradedThisRound || from.tradedThisRound) return;
+    if (to.locked || from.locked) return;
+
+    const offeredItemId = to.pendingTradeOfferedItemId;
+
+    // Clear pending regardless
+    to.pendingTradeFromId = "";
+    to.pendingTradeOfferedItemId = "";
+
+    if (!accept || !requestedItemCardId) return;
+
+    // Validate both items still in hands
+    if (!from.handItemCardIds.includes(offeredItemId)) return;
+    if (!to.handItemCardIds.includes(requestedItemCardId)) return;
+
+    // Swap the cards
+    const fromIdx = from.handItemCardIds.indexOf(offeredItemId);
+    const toIdx = to.handItemCardIds.indexOf(requestedItemCardId);
+
+    from.handItemCardIds[fromIdx] = requestedItemCardId;
+    to.handItemCardIds[toIdx] = offeredItemId;
+
+    // Clear selections if traded card was selected
+    if (from.selectedItemId === offeredItemId) from.selectedItemId = "";
+    if (to.selectedItemId === requestedItemCardId) to.selectedItemId = "";
+
+    from.tradedThisRound = true;
+    to.tradedThisRound = true;
+
+    console.log(`[MatchRoom] Trade complete: ${from.name} gave ${offeredItemId}, got ${requestedItemCardId} from ${to.name}`);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  FIGHT PHASE
+  // ══════════════════════════════════════════════════════════
 
   private startFight() {
     this.state.timerRemainingMs = FIGHT_DURATION_MS;
     this.state.heat = 0;
     this.timeSinceLastCopSpawn = 0;
+    this.fightElapsedMs = 0;
     this.clearCops();
 
     this.state.players.forEach((player) => {
+      // Spawn player-controlled cops for spectators who opted in
+      if (player.role === "spectator" && player.wantsCopNextFight) {
+        this.spawnPlayerCop(player);
+        player.wantsCopNextFight = false;
+        return;
+      }
+
       if (player.role === "spectator") return;
 
       player.alive = true;
@@ -288,17 +444,14 @@ export class MatchRoom extends Room<MatchState> {
       player._killsByTargetId = new Map();
       player._damageByTargetId = new Map();
 
-      // Apply next-round modifiers (from previous round's contract outcomes)
+      // Apply next-round modifiers
       const hpMul = player._nextHpMul;
       const ammoMul = player._nextAmmoMul;
       const speedMul = player._nextSpeedMul;
-
-      // Reset modifiers for next round
       player._nextHpMul = 1;
       player._nextAmmoMul = 1;
       player._nextSpeedMul = 1;
 
-      // Calculate base stats + item card bonuses + modifiers
       let hp = BASE_HP;
       let ammo = BASE_AMMO;
       let speedMultiplier = 1;
@@ -310,7 +463,6 @@ export class MatchRoom extends Room<MatchState> {
         speedMultiplier *= item.speedMul;
       }
 
-      // Apply next-round multipliers from contract outcomes
       hp = Math.round(hp * hpMul);
       ammo = Math.round(ammo * ammoMul);
       speedMultiplier *= speedMul;
@@ -319,7 +471,7 @@ export class MatchRoom extends Room<MatchState> {
       player.ammo = Math.max(0, ammo);
       player._speedMul = speedMultiplier;
 
-      // Set contract action text for HUD
+      // Set contract action text
       if (player.acceptedContractId) {
         const contract = getContractCard(player.acceptedContractId);
         if (contract) {
@@ -337,20 +489,47 @@ export class MatchRoom extends Room<MatchState> {
     this.tickInterval = setInterval(() => this.tick(), TICK_INTERVAL);
   }
 
-  // ── Main tick ──────────────────────────────────────────────
+  private spawnPlayerCop(player: PlayerState) {
+    const cop = new CopState();
+    cop.id = `pcop_${this.nextCopId++}`;
+    cop.hp = PLAYER_COP_HP;
+    cop.speed = PLAYER_COP_SPEED;
+    cop.controllerId = player.id;
+
+    // Spawn at random edge
+    const edge = Math.floor(Math.random() * 4);
+    switch (edge) {
+      case 0: cop.x = 0;         cop.y = Math.random() * MAP_HEIGHT; break;
+      case 1: cop.x = MAP_WIDTH;  cop.y = Math.random() * MAP_HEIGHT; break;
+      case 2: cop.x = Math.random() * MAP_WIDTH; cop.y = 0;          break;
+      case 3: cop.x = Math.random() * MAP_WIDTH; cop.y = MAP_HEIGHT;  break;
+    }
+
+    this.state.cops.set(cop.id, cop);
+    player.role = "cop";
+    player.controlledCopId = cop.id;
+    player._copArrestedIds = new Set();
+    player._moveX = 0;
+    player._moveY = 0;
+    console.log(`[MatchRoom] ${player.name} spawned as player-cop: ${cop.id}`);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  MAIN TICK
+  // ══════════════════════════════════════════════════════════
 
   private tick() {
     const dt = TICK_INTERVAL / 1000;
     const now = Date.now();
 
     this.state.timerRemainingMs -= TICK_INTERVAL;
+    this.fightElapsedMs += TICK_INTERVAL;
     this.state.heat = Math.min(100, this.state.heat + dt * 0.5);
 
     // Process players
     this.state.players.forEach((player) => {
       if (!player.alive || player.role !== "player") return;
 
-      // Movement (with speed multiplier)
       const speed = BASE_PLAYER_SPEED * player._speedMul;
       const dx = player._moveX * speed * dt;
       const dy = player._moveY * speed * dt;
@@ -359,12 +538,10 @@ export class MatchRoom extends Room<MatchState> {
       player.x = Math.max(0, Math.min(MAP_WIDTH, player.x + dx));
       player.y = Math.max(0, Math.min(MAP_HEIGHT, player.y + dy));
 
-      // Track distance
       const movedX = player.x - oldX;
       const movedY = player.y - oldY;
       player._distanceMoved += Math.sqrt(movedX * movedX + movedY * movedY);
 
-      // Hitscan shooting
       if (player.shooting && player.ammo > 0 && now - player._lastFireTime >= FIRE_COOLDOWN_MS) {
         player._lastFireTime = now;
         player.ammo--;
@@ -373,6 +550,19 @@ export class MatchRoom extends Room<MatchState> {
       }
     });
 
+    // Process player-controlled cops (movement only, arrest is manual via message)
+    this.state.players.forEach((player) => {
+      if (player.role !== "cop" || !player.controlledCopId) return;
+      const cop = this.state.cops.get(player.controlledCopId);
+      if (!cop) return;
+
+      const dx = player._moveX * cop.speed * dt;
+      const dy = player._moveY * cop.speed * dt;
+      cop.x = Math.max(0, Math.min(MAP_WIDTH, cop.x + dx));
+      cop.y = Math.max(0, Math.min(MAP_HEIGHT, cop.y + dy));
+    });
+
+    // AI cops
     this.tickCops(dt);
 
     // Cop spawning
@@ -406,14 +596,28 @@ export class MatchRoom extends Room<MatchState> {
     }
   }
 
-  // ── RESOLVE phase ──────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  RESOLVE PHASE
+  // ══════════════════════════════════════════════════════════
 
   private beginResolvePhase() {
     this.state.timerRemainingMs = RESOLVE_PHASE_MS;
     this.clearCops();
 
+    // Revert cop-role players to spectators
+    this.state.players.forEach((player) => {
+      if (player.role === "cop") {
+        player.role = "spectator";
+        player.controlledCopId = "";
+      }
+    });
+
     // Evaluate contracts
     this.state.players.forEach((player) => {
+      if (player.role === "spectator" && !player.acceptedContractId) {
+        player.resolveOutcome = "";
+        return;
+      }
       if (!player.acceptedContractId) {
         player.resolveOutcome = "No contract";
         return;
@@ -451,83 +655,54 @@ export class MatchRoom extends Room<MatchState> {
 
   private evaluateContract(player: PlayerState, contract: ContractCard): boolean {
     switch (contract.conditionType) {
-      case "MOVE_DISTANCE":
-        return player._distanceMoved >= contract.threshold;
-
-      case "ENEMY_DAMAGE_ZERO":
-        return player._enemyDamage === 0;
-
-      case "AMMO_SPENT":
-        return player._ammoSpent >= contract.threshold;
-
-      case "FRIENDLY_FIRE":
-        return player._friendlyFireDamage >= contract.threshold;
-
-      case "DAMAGE_TARGET": {
-        const dmg = player._damageByTargetId.get(player._contractTargetId) ?? 0;
-        return dmg >= contract.threshold;
-      }
-
-      case "KILL_TEAMMATE":
-        return player._kills >= 1;
-
-      case "KILL_TARGET":
-        return (player._killsByTargetId.get(player._contractTargetId) ?? 0) >= 1;
-
-      default:
-        return false;
+      case "MOVE_DISTANCE":     return player._distanceMoved >= contract.threshold;
+      case "ENEMY_DAMAGE_ZERO": return player._enemyDamage === 0;
+      case "AMMO_SPENT":        return player._ammoSpent >= contract.threshold;
+      case "FRIENDLY_FIRE":     return player._friendlyFireDamage >= contract.threshold;
+      case "DAMAGE_TARGET":     return (player._damageByTargetId.get(player._contractTargetId) ?? 0) >= contract.threshold;
+      case "KILL_TEAMMATE":     return player._kills >= 1;
+      case "KILL_TARGET":       return (player._killsByTargetId.get(player._contractTargetId) ?? 0) >= 1;
+      default:                  return false;
     }
   }
 
   private applyReward(player: PlayerState, contract: ContractCard) {
     switch (contract.rewardType) {
-      case "HP_BOOST":
-        player._nextHpMul = 1 + contract.rewardValue;
-        break;
-      case "AMMO_BOOST":
-        player._nextAmmoMul = 1 + contract.rewardValue;
-        break;
-      case "SPEED_BOOST":
-        player._nextSpeedMul = 1 + contract.rewardValue;
-        break;
+      case "HP_BOOST":    player._nextHpMul = 1 + contract.rewardValue; break;
+      case "AMMO_BOOST":  player._nextAmmoMul = 1 + contract.rewardValue; break;
+      case "SPEED_BOOST": player._nextSpeedMul = 1 + contract.rewardValue; break;
     }
   }
 
   private applyPenalty(player: PlayerState, contract: ContractCard) {
     switch (contract.penaltyType) {
-      case "AMMO_CUT":
-        player._nextAmmoMul = 1 - contract.penaltyValue;
-        break;
-      case "REVEAL_CARDS":
-        player._nextRevealCards = true;
-        break;
-      case "SLOT_REDUCTION":
-        // For MVP: just cut ammo slightly as placeholder
-        player._nextAmmoMul = 0.8;
-        break;
+      case "AMMO_CUT":       player._nextAmmoMul = 1 - contract.penaltyValue; break;
+      case "REVEAL_CARDS":   player._nextRevealCards = true; break;
+      case "SLOT_REDUCTION": player._nextAmmoMul = 0.8; break;
     }
   }
 
-  private rewardText(contract: ContractCard): string {
-    switch (contract.rewardType) {
-      case "HP_BOOST": return `+${Math.round(contract.rewardValue * 100)}% HP next round`;
-      case "AMMO_BOOST": return `+${Math.round(contract.rewardValue * 100)}% ammo next round`;
-      case "SPEED_BOOST": return `+${Math.round(contract.rewardValue * 100)}% speed next round`;
+  private rewardText(c: ContractCard): string {
+    switch (c.rewardType) {
+      case "HP_BOOST":    return `+${Math.round(c.rewardValue * 100)}% HP next round`;
+      case "AMMO_BOOST":  return `+${Math.round(c.rewardValue * 100)}% ammo next round`;
+      case "SPEED_BOOST": return `+${Math.round(c.rewardValue * 100)}% speed next round`;
     }
   }
 
-  private penaltyText(contract: ContractCard): string {
-    switch (contract.penaltyType) {
-      case "AMMO_CUT": return `-${Math.round(contract.penaltyValue * 100)}% ammo next round`;
-      case "REVEAL_CARDS": return "Cards revealed next round";
+  private penaltyText(c: ContractCard): string {
+    switch (c.penaltyType) {
+      case "AMMO_CUT":       return `-${Math.round(c.penaltyValue * 100)}% ammo next round`;
+      case "REVEAL_CARDS":   return "Cards revealed next round";
       case "SLOT_REDUCTION": return "-20% ammo next round";
     }
   }
 
-  // ── Hitscan shooting ──────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  HITSCAN SHOOTING
+  // ══════════════════════════════════════════════════════════
 
   private processShot(shooter: PlayerState) {
-    // Check against all other alive players
     this.state.players.forEach((target) => {
       if (target.id === shooter.id || !target.alive || target.role !== "player") return;
 
@@ -536,46 +711,47 @@ export class MatchRoom extends Room<MatchState> {
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist > SHOT_RANGE || dist < 1) return;
 
-      const angleToTarget = Math.atan2(dy, dx);
-      let angleDiff = angleToTarget - shooter.aim;
+      let angleDiff = Math.atan2(dy, dx) - shooter.aim;
       while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
       while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
 
       if (Math.abs(angleDiff) <= SHOT_HALF_ANGLE) {
-        // Track metrics before applying damage
         shooter._enemyDamage += SHOT_DAMAGE;
         shooter._friendlyFireDamage += SHOT_DAMAGE;
-
-        const prevDmg = shooter._damageByTargetId.get(target.id) ?? 0;
-        shooter._damageByTargetId.set(target.id, prevDmg + SHOT_DAMAGE);
+        shooter._damageByTargetId.set(target.id, (shooter._damageByTargetId.get(target.id) ?? 0) + SHOT_DAMAGE);
 
         const wasAlive = target.alive;
         this.applyDamage(target, SHOT_DAMAGE);
 
-        // Track kill
         if (wasAlive && !target.alive) {
           shooter._kills++;
-          const prevKills = shooter._killsByTargetId.get(target.id) ?? 0;
-          shooter._killsByTargetId.set(target.id, prevKills + 1);
+          shooter._killsByTargetId.set(target.id, (shooter._killsByTargetId.get(target.id) ?? 0) + 1);
         }
       }
     });
 
-    // Check against cops
+    // Cops
     this.state.cops.forEach((cop, copId) => {
       const dx = cop.x - shooter.x;
       const dy = cop.y - shooter.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist > SHOT_RANGE || dist < 1) return;
 
-      const angleToTarget = Math.atan2(dy, dx);
-      let angleDiff = angleToTarget - shooter.aim;
+      let angleDiff = Math.atan2(dy, dx) - shooter.aim;
       while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
       while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
 
       if (Math.abs(angleDiff) <= SHOT_HALF_ANGLE) {
         cop.hp -= SHOT_DAMAGE;
         if (cop.hp <= 0) {
+          // If player-controlled cop dies, revert controller to spectator
+          if (cop.controllerId) {
+            const ctrl = this.state.players.get(cop.controllerId);
+            if (ctrl) {
+              ctrl.role = "spectator";
+              ctrl.controlledCopId = "";
+            }
+          }
           this.state.cops.delete(copId);
         }
       }
@@ -595,13 +771,16 @@ export class MatchRoom extends Room<MatchState> {
     }
   }
 
-  // ── Cops AI ────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  COPS AI (only for AI cops, skip player-controlled)
+  // ══════════════════════════════════════════════════════════
 
   private spawnCop() {
     const cop = new CopState();
     cop.id = `cop_${this.nextCopId++}`;
     cop.hp = COP_HP;
     cop.speed = COP_SPEED;
+    cop.controllerId = "";
 
     const edge = Math.floor(Math.random() * 4);
     switch (edge) {
@@ -621,6 +800,8 @@ export class MatchRoom extends Room<MatchState> {
     if (alivePlayers.length === 0) return;
 
     this.state.cops.forEach((cop, copId) => {
+      if (cop.controllerId) return; // skip player-controlled cops
+
       let nearest: PlayerState | null = null;
       let nearestDist = Infinity;
       for (const p of alivePlayers) {
@@ -646,7 +827,7 @@ export class MatchRoom extends Room<MatchState> {
         nearest._moveX = 0;
         nearest._moveY = 0;
         nearest.shooting = false;
-        console.log(`[MatchRoom] ${nearest.name} was arrested by ${copId}`);
+        console.log(`[MatchRoom] ${nearest.name} arrested by AI cop ${copId}`);
       }
     });
   }
@@ -654,14 +835,29 @@ export class MatchRoom extends Room<MatchState> {
   private clearCops() {
     const ids = Array.from(this.state.cops.keys());
     for (const id of ids) this.state.cops.delete(id);
+
+    // Revert any cop-role players
+    this.state.players.forEach((player) => {
+      if (player.role === "cop") {
+        player.role = "spectator";
+        player.controlledCopId = "";
+      }
+    });
   }
 
-  // ── Input handling ─────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  INPUT HANDLING
+  // ══════════════════════════════════════════════════════════
 
   private handleInput(client: Client, msg: InputMessage) {
     const player = this.state.players.get(client.sessionId);
-    if (!player || !player.alive || player.role !== "player") return;
+    if (!player) return;
     if (this.state.phase !== Phase.FIGHT) return;
+
+    // Route cop inputs to cop.input handler instead
+    if (player.role === "cop") return;
+
+    if (!player.alive || player.role !== "player") return;
 
     player._moveX = Math.max(-1, Math.min(1, msg.moveX));
     player._moveY = Math.max(-1, Math.min(1, msg.moveY));
@@ -670,13 +866,12 @@ export class MatchRoom extends Room<MatchState> {
     player.lastInputSeq = msg.seq;
   }
 
-  // ── Helpers ────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════
+  //  HELPERS
+  // ══════════════════════════════════════════════════════════
 
   private resetPlayersForRound() {
     this.state.players.forEach((player) => {
-      if (player.role === "spectator" && !player.alive) {
-        // Dead spectators stay spectators but get revived for next round
-      }
       player.alive = true;
       player.role = "player";
       player.hp = BASE_HP;
@@ -686,6 +881,8 @@ export class MatchRoom extends Room<MatchState> {
       player._moveY = 0;
       player._lastFireTime = 0;
       player._speedMul = 1;
+      player.controlledCopId = "";
+      player.wantsCopNextFight = false;
     });
   }
 

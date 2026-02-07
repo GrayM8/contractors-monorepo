@@ -21,6 +21,17 @@ export class TableScene extends Phaser.Scene {
   private selectedItemId: string = "";
   private hasBuiltUI = false;
 
+  // Cop opt-in UI
+  private copOptBtn: Phaser.GameObjects.Container | null = null;
+  private copOptLabel: Phaser.GameObjects.Text | null = null;
+
+  // Trade UI
+  private tradeButtons: Phaser.GameObjects.Container[] = [];
+  private tradeTargetPanel: Phaser.GameObjects.Container | null = null;
+  private tradeIncomingPanel: Phaser.GameObjects.Container | null = null;
+  private tradingItemId: string = "";
+  private tradeCardButtons: Phaser.GameObjects.Container[] = [];
+
   constructor() {
     super({ key: "TableScene" });
   }
@@ -35,6 +46,13 @@ export class TableScene extends Phaser.Scene {
     this.revealBanner = null;
     this.selectedItemId = "";
     this.hasBuiltUI = false;
+    this.copOptBtn = null;
+    this.copOptLabel = null;
+    this.tradeButtons = [];
+    this.tradeTargetPanel = null;
+    this.tradeIncomingPanel = null;
+    this.tradingItemId = "";
+    this.tradeCardButtons = [];
 
     // Title
     this.phaseText = this.add.text(600, 40, "", {
@@ -46,7 +64,7 @@ export class TableScene extends Phaser.Scene {
     }).setOrigin(0.5);
 
     // Status
-    this.statusText = this.add.text(600, 700, "", {
+    this.statusText = this.add.text(600, 750, "", {
       fontSize: "16px", color: "#aaaaaa",
     }).setOrigin(0.5);
 
@@ -78,17 +96,32 @@ export class TableScene extends Phaser.Scene {
       this.phaseText.setText(`RESOLVE — Round ${state.roundNumber}`);
     }
 
-    // Build item/contract UI once we have card data
-    if (!this.hasBuiltUI && local.handItemCardIds.length > 0) {
+    // Spectator cop opt-in UI
+    if (local.role === "spectator" && (state.phase === "CARD" || state.phase === "LOCK")) {
+      this.showCopOptIn(local);
+    }
+
+    // Build item/contract UI once we have card data (non-spectators)
+    if (!this.hasBuiltUI && local.handItemCardIds.length > 0 && local.role !== "spectator") {
       this.buildCardUI(local);
       this.hasBuiltUI = true;
     }
 
     // Update selection highlights
-    this.updateHighlights(local);
+    if (this.hasBuiltUI) {
+      this.updateHighlights(local);
+    }
 
     // Update status
-    if (local.locked) {
+    if (local.role === "spectator") {
+      if (local.wantsCopNextFight) {
+        this.statusText.setText("You will play as a COP next fight!");
+        this.statusText.setColor("#4488ff");
+      } else {
+        this.statusText.setText("You are spectating. Opt in as a cop for the next fight.");
+        this.statusText.setColor("#888888");
+      }
+    } else if (local.locked) {
       const itemInfo = getItemCardInfo(local.selectedItemId);
       const contractAccepted = local.acceptedContractId !== "";
       this.statusText.setText(
@@ -117,6 +150,35 @@ export class TableScene extends Phaser.Scene {
         backgroundColor: "#330000", padding: { x: 12, y: 4 },
       }).setOrigin(0.5);
     }
+
+    // Incoming trade modal
+    this.updateIncomingTrade(local, state);
+  }
+
+  // ── Cop opt-in UI ─────────────────────────────────────────
+
+  private showCopOptIn(local: { wantsCopNextFight: boolean }) {
+    if (this.copOptBtn) {
+      // Update label
+      if (this.copOptLabel) {
+        this.copOptLabel.setText(local.wantsCopNextFight ? "CANCEL COP" : "OPT IN AS COP");
+      }
+      const bg = this.copOptBtn.getAt(0) as Phaser.GameObjects.Rectangle;
+      bg.setFillStyle(local.wantsCopNextFight ? 0x553322 : 0x224488);
+      return;
+    }
+
+    const bg = this.add.rectangle(0, 0, 200, 50, 0x224488).setStrokeStyle(2, 0x6688cc);
+    bg.setInteractive({ useHandCursor: true });
+    bg.on("pointerdown", () => {
+      this.network.sendOptCop();
+    });
+
+    this.copOptLabel = this.add.text(0, 0, "OPT IN AS COP", {
+      fontSize: "16px", color: "#ffffff", fontStyle: "bold",
+    }).setOrigin(0.5);
+
+    this.copOptBtn = this.add.container(600, 400, [bg, this.copOptLabel]);
   }
 
   // ── Build card UI ──────────────────────────────────────────
@@ -127,7 +189,7 @@ export class TableScene extends Phaser.Scene {
     const startX = (1200 - totalWidth) / 2 + CARD_W / 2;
 
     // Item cards
-    this.add.text(600, CARD_Y - 80, "ITEM CARDS (select one)", {
+    this.add.text(600, CARD_Y - 80, "ITEM CARDS (select one — click TRADE to offer)", {
       fontSize: "14px", color: "#888888",
     }).setOrigin(0.5);
 
@@ -142,6 +204,12 @@ export class TableScene extends Phaser.Scene {
         () => this.onSelectItem(itemId)
       );
       this.itemButtons.push(container);
+
+      // Trade button under each card
+      const tradeBtn = this.createActionButton(x, CARD_Y + CARD_H / 2 + 24, "TRADE", 0x443355, () => {
+        this.onStartTrade(itemId);
+      });
+      this.tradeButtons.push(tradeBtn);
     });
 
     // Contract card
@@ -226,9 +294,169 @@ export class TableScene extends Phaser.Scene {
     this.network.sendSelectItem(itemId);
   }
 
+  // ── Trading ──────────────────────────────────────────────
+
+  private onStartTrade(itemId: string) {
+    const local = this.network.roomState?.players.get(this.network.sessionId);
+    if (!local || local.locked || local.tradedThisRound) return;
+    if (this.network.roomState?.phase !== "CARD") return;
+
+    this.tradingItemId = itemId;
+    this.showTradeTargetPicker();
+  }
+
+  private showTradeTargetPicker() {
+    this.closeTradeTargetPicker();
+
+    const state = this.network.roomState;
+    if (!state) return;
+
+    const otherPlayers: { sessionId: string; name: string }[] = [];
+    state.players.forEach((p, sid) => {
+      if (sid !== this.network.sessionId && p.role !== "spectator" && !p.tradedThisRound && !p.locked) {
+        otherPlayers.push({ sessionId: sid, name: p.name });
+      }
+    });
+
+    if (otherPlayers.length === 0) return;
+
+    const children: Phaser.GameObjects.GameObject[] = [];
+
+    // Background
+    const panelH = 60 + otherPlayers.length * 40;
+    const panelBg = this.add.rectangle(0, 0, 240, panelH, 0x222233, 0.95).setStrokeStyle(2, 0x6666aa);
+    children.push(panelBg);
+
+    const titleText = this.add.text(0, -panelH / 2 + 16, "Send trade to:", {
+      fontSize: "14px", color: "#cccccc", fontStyle: "bold",
+    }).setOrigin(0.5, 0);
+    children.push(titleText);
+
+    otherPlayers.forEach((p, i) => {
+      const btnY = -panelH / 2 + 50 + i * 40;
+      const bg = this.add.rectangle(0, btnY, 200, 30, 0x335544).setStrokeStyle(1, 0x669966);
+      bg.setInteractive({ useHandCursor: true });
+      bg.on("pointerdown", () => {
+        this.network.sendTradeOffer(p.sessionId, this.tradingItemId);
+        this.closeTradeTargetPicker();
+      });
+      children.push(bg);
+
+      const txt = this.add.text(0, btnY, p.name, {
+        fontSize: "12px", color: "#ffffff",
+      }).setOrigin(0.5);
+      children.push(txt);
+    });
+
+    // Close button
+    const closeBtn = this.add.text(100, -panelH / 2 + 4, "X", {
+      fontSize: "14px", color: "#ff4444", fontStyle: "bold",
+    }).setOrigin(0.5, 0).setInteractive({ useHandCursor: true });
+    closeBtn.on("pointerdown", () => this.closeTradeTargetPicker());
+    children.push(closeBtn);
+
+    this.tradeTargetPanel = this.add.container(600, 400, children).setDepth(100);
+  }
+
+  private closeTradeTargetPicker() {
+    if (this.tradeTargetPanel) {
+      this.tradeTargetPanel.destroy();
+      this.tradeTargetPanel = null;
+    }
+  }
+
+  // ── Incoming trade modal ──────────────────────────────────
+
+  private updateIncomingTrade(
+    local: { pendingTradeFromId: string; pendingTradeOfferedItemId: string; tradedThisRound: boolean; locked: boolean; handItemCardIds: string[] },
+    state: { phase: string; players: Map<string, { name: string }> }
+  ) {
+    if (local.pendingTradeFromId && !local.tradedThisRound && !local.locked && state.phase === "CARD") {
+      if (!this.tradeIncomingPanel) {
+        this.showIncomingTradeModal(local, state);
+      }
+    } else {
+      this.closeIncomingTrade();
+    }
+  }
+
+  private showIncomingTradeModal(
+    local: { pendingTradeFromId: string; pendingTradeOfferedItemId: string; handItemCardIds: string[] },
+    state: { players: Map<string, { name: string }> }
+  ) {
+    const fromPlayer = state.players.get(local.pendingTradeFromId);
+    const offeredInfo = getItemCardInfo(local.pendingTradeOfferedItemId);
+
+    const children: Phaser.GameObjects.GameObject[] = [];
+    const cardCount = local.handItemCardIds.length;
+    const panelH = 140 + cardCount * 36;
+
+    const panelBg = this.add.rectangle(0, 0, 300, panelH, 0x222233, 0.95).setStrokeStyle(2, 0xaaaa44);
+    children.push(panelBg);
+
+    const titleText = this.add.text(0, -panelH / 2 + 14, "INCOMING TRADE", {
+      fontSize: "16px", color: "#ffcc00", fontStyle: "bold",
+    }).setOrigin(0.5, 0);
+    children.push(titleText);
+
+    const offerText = this.add.text(0, -panelH / 2 + 38, `${fromPlayer?.name ?? "?"} offers: ${offeredInfo?.name ?? local.pendingTradeOfferedItemId}`, {
+      fontSize: "12px", color: "#cccccc", wordWrap: { width: 270 }, align: "center",
+    }).setOrigin(0.5, 0);
+    children.push(offerText);
+
+    const pickText = this.add.text(0, -panelH / 2 + 64, "Select a card to trade back:", {
+      fontSize: "11px", color: "#999999",
+    }).setOrigin(0.5, 0);
+    children.push(pickText);
+
+    // Show local cards as trade-back options
+    this.tradeCardButtons = [];
+    local.handItemCardIds.forEach((cardId, i) => {
+      const btnY = -panelH / 2 + 90 + i * 36;
+      const info = getItemCardInfo(cardId);
+      const bg = this.add.rectangle(0, btnY, 260, 28, 0x334455).setStrokeStyle(1, 0x668899);
+      bg.setInteractive({ useHandCursor: true });
+      bg.on("pointerdown", () => {
+        this.network.sendTradeRespond(local.pendingTradeFromId, true, cardId);
+        this.closeIncomingTrade();
+      });
+      children.push(bg);
+
+      const txt = this.add.text(0, btnY, info?.name ?? cardId, {
+        fontSize: "11px", color: "#ffffff",
+      }).setOrigin(0.5);
+      children.push(txt);
+    });
+
+    // Decline button
+    const declineY = -panelH / 2 + 90 + cardCount * 36 + 10;
+    const declineBg = this.add.rectangle(0, declineY, 120, 30, 0x552222).setStrokeStyle(1, 0x884444);
+    declineBg.setInteractive({ useHandCursor: true });
+    declineBg.on("pointerdown", () => {
+      this.network.sendTradeRespond(local.pendingTradeFromId, false);
+      this.closeIncomingTrade();
+    });
+    children.push(declineBg);
+
+    const declineText = this.add.text(0, declineY, "DECLINE", {
+      fontSize: "12px", color: "#ff6666", fontStyle: "bold",
+    }).setOrigin(0.5);
+    children.push(declineText);
+
+    this.tradeIncomingPanel = this.add.container(600, 400, children).setDepth(100);
+  }
+
+  private closeIncomingTrade() {
+    if (this.tradeIncomingPanel) {
+      this.tradeIncomingPanel.destroy();
+      this.tradeIncomingPanel = null;
+      this.tradeCardButtons = [];
+    }
+  }
+
   // ── Highlight selected item ────────────────────────────────
 
-  private updateHighlights(local: { selectedItemId: string; handItemCardIds: string[]; locked: boolean }) {
+  private updateHighlights(local: { selectedItemId: string; handItemCardIds: string[]; locked: boolean; tradedThisRound: boolean }) {
     const selectedId = local.selectedItemId || this.selectedItemId;
 
     this.itemButtons.forEach((container, i) => {
@@ -243,6 +471,11 @@ export class TableScene extends Phaser.Scene {
       if (local.locked) {
         bg.setAlpha(itemId === selectedId ? 1 : 0.4);
       }
+    });
+
+    // Dim trade buttons when locked or already traded
+    this.tradeButtons.forEach((btn) => {
+      btn.setAlpha(local.locked || local.tradedThisRound ? 0.3 : 1);
     });
 
     // Dim accept/refuse when locked
